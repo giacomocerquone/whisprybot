@@ -13,6 +13,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -39,15 +40,45 @@ COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 LANGUAGE = os.environ.get("WHISPER_LANGUAGE") or None
 BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", "1"))
+TRANSCRIBE_TIMEOUT_S = int(os.environ.get("WHISPER_TIMEOUT_S", "900"))
+WARMUP_ON_START = os.environ.get("WHISPER_WARMUP_ON_START", "1").strip() not in {"0", "false", "False"}
 
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "WARNING").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.WARNING),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("whisprybot")
 
+# Silence libraries that log full request URLs (includes bot token).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+
 _model: WhisperModel | None = None
 _model_lock = threading.Lock()
+
+
+def _repo_id_for_model_size(size: str) -> str:
+    return f"Systran/faster-whisper-{size}"
+
+
+def warmup_model() -> None:
+    """Download + initialize Whisper model (runs in a thread)."""
+    _ = get_model()
+
+
+async def _post_init(app: object) -> None:
+    # Runs once after PTB is initialized, before polling starts.
+    # We start warmup in background so /start remains responsive.
+    if not WARMUP_ON_START:
+        logger.info("Model warmup disabled (WHISPER_WARMUP_ON_START=0).")
+        return
+    logger.info("Starting model warmup in background…")
+    asyncio.create_task(asyncio.to_thread(warmup_model))
 
 
 def get_model() -> WhisperModel:
@@ -55,14 +86,11 @@ def get_model() -> WhisperModel:
     global _model
     with _model_lock:
         if _model is None:
-            logger.info(
-                "Loading Whisper model %r (%s / %s); first run may download weights…",
-                MODEL_SIZE,
-                DEVICE,
-                COMPUTE_TYPE,
-            )
+            repo_id = _repo_id_for_model_size(MODEL_SIZE)
+            from huggingface_hub import snapshot_download
+
+            snapshot_download(repo_id=repo_id, allow_patterns=["*"], local_files_only=False)
             _model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-            logger.info("Whisper model ready.")
         return _model
 
 
@@ -74,7 +102,14 @@ def _transcribe_file_sync(in_path: str) -> tuple[str, Any]:
         vad_filter=True,
         language=LANGUAGE,
     )
-    text = " ".join(seg.text.strip() for seg in segments).strip()
+    parts: list[str] = []
+    seg_count = 0
+    for seg in segments:
+        seg_count += 1
+        t = (seg.text or "").strip()
+        if t:
+            parts.append(t)
+    text = " ".join(parts).strip()
     return text, info
 
 
@@ -164,7 +199,17 @@ async def transcribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         await status.edit_text("Transcribing locally...")
         try:
-            text, info = await asyncio.to_thread(_transcribe_file_sync, in_path)
+            text, info = await asyncio.wait_for(
+                asyncio.to_thread(_transcribe_file_sync, in_path),
+                timeout=TRANSCRIBE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.exception("Transcription timed out after %ss", TRANSCRIBE_TIMEOUT_S)
+            await status.edit_text(
+                f"Transcription timed out after {TRANSCRIBE_TIMEOUT_S}s. "
+                "Try a shorter clip or use a smaller model."
+            )
+            return
         except Exception:
             logger.exception("Transcription failed")
             await status.edit_text("Transcription failed. Check logs or try again.")
@@ -191,8 +236,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.exception("Unhandled exception", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            err = html.escape(str(context.error))[:1000]
-            await update.effective_message.reply_text(f"Error: {err}")
+            await update.effective_message.reply_text("Error: something went wrong.")
         except Exception:
             pass
 
@@ -201,7 +245,7 @@ def main() -> None:
     if not TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in .env")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("lang", set_lang))
@@ -212,7 +256,6 @@ def main() -> None:
         )
     )
     app.add_error_handler(error_handler)
-    logger.info("Polling Telegram; Whisper loads on first audio (not at startup).")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
