@@ -1,0 +1,10 @@
+services:
+  whisprybot:
+    build: .
+    container_name: whisprybot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./models:/app/.cache/huggingface
+    working_dir: /app
